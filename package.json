@@ -1,0 +1,23 @@
+{
+  "name": "contract",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "deploy:hardhat": "hardhat run script/deploy.js",
+    "deploy:sepolia": "hardhat run script/deploy.js --network sepolia"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.8.2",
+    "@uma/core": "^2.54.0",
+    "dotenv": "^16.4.7",
+    "hardhat": "^2.7.0",
+    "hardhat-dependency-compiler": "^1.2.1"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0"
+  }
+}
