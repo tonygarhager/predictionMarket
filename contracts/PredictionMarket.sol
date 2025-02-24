@@ -1,20 +1,73 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+//import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@uma/core/contracts/common/implementation/AddressWhitelist.sol";
 import "@uma/core/contracts/data-verification-mechanism/implementation/Constants.sol";
 import "@uma/core/contracts/optimistic-oracle-v2/interfaces/OptimisticOracleV2Interface.sol";
 
 import { AncillaryDataLib } from "./libraries/AncillaryDataLib.sol";
 import { Auth } from "./libraries/Auth.sol";
+import { TransferHelper } from "./libraries/TransferHelper.sol";
+import { ERC20 } from "./libraries/ERC20.sol";
+
+
+/**
+ * @title Optimistic Requester.
+ * @notice Optional interface that requesters can implement to receive callbacks.
+ * @dev this contract does _not_ work with ERC777 collateral currencies or any others that call into the receiver on
+ * transfer(). Using an ERC777 token would allow a user to maliciously grief other participants (while also losing
+ * money themselves).
+ */
+interface OptimisticRequester {
+    /**
+     * @notice Callback for proposals.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     */
+    function priceProposed(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData
+    ) external;
+
+    /**
+     * @notice Callback for disputes.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     * @param refund refund received in the case that refundOnDispute was enabled.
+     */
+    function priceDisputed(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        uint256 refund
+    ) external;
+
+    /**
+     * @notice Callback for settlement.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     * @param price price that was resolved by the escalation process.
+     */
+    function priceSettled(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        int256 price
+    ) external;
+}
+
 // This contract allows to initialize prediction markets each having a pair of binary outcome tokens. Anyone can mint
 // and burn the same amount of paired outcome tokens for the default payout currency. Trading of outcome tokens is
 // outside the scope of this contract. Anyone can assert 3 possible outcomes (outcome 1, outcome 2 or split) that is
 // verified through Optimistic Oracle V3. If the assertion is resolved true then holders of outcome tokens can settle
 // them for the payout currency based on resolved market outcome.
-contract PredictionMarket is Auth {
-    using SafeERC20 for IERC20;
+contract PredictionMarket is Auth, OptimisticRequester {
+    //using SafeERC20 for IERC20;
 
     //errors
     error InvalidAncillaryData();
@@ -47,9 +100,9 @@ contract PredictionMarket is Auth {
 
     mapping(bytes32 => AssertedMarket) public assertedMarkets; // Maps assertionId to AssertedMarket.
 
-    IERC20 public immutable currency; // Currency used for all prediction markets.
+    ERC20 public immutable currency; // Currency used for all prediction markets.
     OptimisticOracleV2Interface public immutable oo;
-    uint64 public constant assertionLiveness = 120; // 2 hours.
+    //uint64 public constant assertionLiveness = 120; // 2 hours.
     uint256 public constant maxAncillaryData = 8139;
     //bytes32 public constant defaultIdentifier = 0x4153534552545f54525554480000000000000000000000000000000000000000; // Identifier used for all prediction markets.
     
@@ -60,8 +113,9 @@ contract PredictionMarket is Auth {
     mapping(address => bool) private verifiers;
 
     event MarketInitialized(bytes32 indexed marketId, string outcome1, string outcome2, string description, uint256 reward, uint256 requiredBond);
-    event MarketAsserted(bytes32 indexed marketId, bytes32 indexed assertionId);
-    event MarketDisputed(bytes32 indexed marketId, bytes32 indexed assertionId);
+    event MarketAsserted(bytes32 identifier, uint256 timestamp, bytes ancillaryData);
+    event MarketDisputed(bytes32 identifier, uint256 timestamp, bytes ancillaryData, uint256 refund);
+    event MarketResultSettled(bytes32 identifier, uint256 timestamp, bytes ancillaryData, int256 price);
     event MarketResolved(bytes32 indexed marketId, int256 price, uint256[] payouts);
     event MarketPaused(bytes32 indexed marketId);
     event MarketUnpaused(bytes32 indexed marketId);
@@ -71,7 +125,7 @@ contract PredictionMarket is Auth {
         address _currency,
         address _optimisticOracleV2
     ) {
-        currency = IERC20(_currency);
+        currency = ERC20(_currency);
         oo = OptimisticOracleV2Interface(_optimisticOracleV2);
     }
 
@@ -83,11 +137,12 @@ contract PredictionMarket is Auth {
 
     function createMarket(
         bytes32 marketId,
-        string memory outcome1, // Short name of the first outcome.
-        string memory outcome2, // Short name of the second outcome.
-        string memory description, // Description of the market.
-        uint256 reward, // Reward available for asserting true market outcome.
-        uint256 requiredBond // Expected bond to assert market outcome (OOv3 can require higher bond).
+        string memory outcome1,     // Short name of the first outcome.
+        string memory outcome2,     // Short name of the second outcome.
+        string memory description,  // Description of the market.
+        uint256 reward,             // Reward available for asserting true market outcome.
+        uint256 requiredBond,       // Expected bond to assert market outcome (OOv3 can require higher bond).
+        uint256 assertionLiveness    // Market live during assertionLiveness
     ) public {
         require(markets[marketId].description.length == 0, "Market exists");
         require(bytes(outcome1).length > 0, "Empty first outcome");
@@ -112,12 +167,44 @@ contract PredictionMarket is Auth {
             requiredBond: requiredBond,
             outcome1: bytes(outcome1),
             outcome2: bytes(outcome2),
-            description: bytes(description),
+            description: data,
             requestTimestamp: timestamp
         });
         _requestPrice(msg.sender, timestamp, data, address(currency), reward, requiredBond);
-
+        oo.setCustomLiveness(yesOrNoIdentifier, timestamp, data, assertionLiveness);
         emit MarketInitialized(marketId, outcome1, outcome2, description, reward, requiredBond);
+    }
+
+    
+    function assertMarket(bytes32 marketId, string memory assertedOutcome) public {
+        Market storage market = markets[marketId];
+        require(market.assertedOutcomeId == 0, "Assertion active or resolved");
+        bytes32 assertedOutcomeHash = keccak256(bytes(assertedOutcome));
+        int256 assertedOutcomeId = 0;
+        if (assertedOutcomeHash == keccak256(market.outcome1))
+            assertedOutcomeId = 1;
+        else if (assertedOutcomeHash == keccak256(market.outcome2))
+            assertedOutcomeId = 2;
+        else if (assertedOutcomeHash == keccak256(unresolvable))
+            assertedOutcomeId = 3;
+        else
+            revert("Invalid asserted outcome");
+
+        market.assertedOutcomeId = assertedOutcomeId;
+        //OOv2 has not minimum bond
+        uint256 bond = market.requiredBond;
+        
+        // Pull bond and make the assertion.
+        TransferHelper._transferFromERC20(address(currency), msg.sender, address(this), bond);
+        if (IERC20(address(currency)).allowance(address(this), address(oo)) < bond) {
+            IERC20(address(currency)).approve(address(oo), type(uint256).max);
+        }
+        //currency.safeTransferFrom(msg.sender, address(this), bond);
+        //currency.safeApprove(address(oo), bond);
+        oo.proposePriceFor(msg.sender, address(this), yesOrNoIdentifier, market.requestTimestamp, market.description, market.assertedOutcomeId);
+       
+        // Store the asserter and marketId for the assertionResolvedCallback.
+        assertedMarkets[market.assertionId] = AssertedMarket({ asserter: msg.sender, marketId: marketId });
     }
 
     /// @notice Checks whether a marketId is ready to be resolved
@@ -153,8 +240,8 @@ contract PredictionMarket is Auth {
 
         // If the market has not been reset previously, reset the market
         // Ensures that there are at most 2 OO Requests at a time for a market
-        _reset(address(this), marketId, market);
-        emit MarketDisputed(marketId, market.assertionId);
+        //_reset(address(this), marketId, market);
+        oo.disputePriceFor(msg.sender, address(this), yesOrNoIdentifier, market.requestTimestamp, market.description);
     }
 
     /// @notice Checks if a market is initialized
@@ -171,6 +258,7 @@ contract PredictionMarket is Auth {
     /// @notice Allows an admin to reset a market, sending out a new price request to the OO.
     /// Failsafe to be used if the priceDisputed callback reverts during execution.
     /// @param marketId - The unique marketId
+    /*
     function reset(bytes32 marketId) external onlyAdmin {
         Market storage market = markets[marketId];
         if (!_isInitialized(market)) revert NotInitialized();
@@ -179,7 +267,7 @@ contract PredictionMarket is Auth {
         // Reset the market, paying for the price request from the caller
         _reset(msg.sender, marketId, market);
     }
-
+    */
     
     /// @notice Allows an admin to pause market resolution in an emergency
     /// @param marketId - The unique marketId of the market
@@ -202,44 +290,56 @@ contract PredictionMarket is Auth {
         emit MarketUnpaused(marketId);
     }
 
-    
-    function assertMarket(bytes32 marketId, string memory assertedOutcome) public {
-        Market storage market = markets[marketId];
-        require(market.assertedOutcomeId == 0, "Assertion active or resolved");
-        bytes32 assertedOutcomeHash = keccak256(bytes(assertedOutcome));
-        int256 assertedOutcomeId = 0;
-        if (assertedOutcomeHash == keccak256(market.outcome1))
-            assertedOutcomeId = 1;
-        else if (assertedOutcomeHash == keccak256(market.outcome2))
-            assertedOutcomeId = 2;
-        else if (assertedOutcomeHash == keccak256(unresolvable))
-            assertedOutcomeId = 3;
-        else
-            revert("Invalid asserted outcome");
+    /*///////////////////////////////////////////////////////////////////
+                            CALLBACK FUNCTIONS 
+    //////////////////////////////////////////////////////////////////*/
 
-        market.assertedOutcomeId = assertedOutcomeId;
-        //OOv2 has not minimum bond
-        uint256 bond = market.requiredBond;
-        /*
-        bytes memory claim = abi.encodePacked(
-            "As of assertion timestamp ",
-            ClaimData.toUtf8BytesUint(block.timestamp),
-            ", the described prediction market outcome is: ",
-            assertedOutcome,
-            ". The market description is: ",
-            market.description
-        );
-        */
-        // Pull bond and make the assertion.
-        currency.safeTransferFrom(msg.sender, address(this), bond);
-        currency.safeApprove(address(oo), bond);
-        oo.proposePrice(msg.sender, yesOrNoIdentifier, block.timestamp, market.description, market.assertedOutcomeId);
-       
-        // Store the asserter and marketId for the assertionResolvedCallback.
-        assertedMarkets[market.assertionId] = AssertedMarket({ asserter: msg.sender, marketId: marketId });
-
-        emit MarketAsserted(marketId, market.assertionId);
+    /**
+     * @notice Callback for proposals.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     */
+    function priceProposed(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData
+    ) external {
+        emit MarketAsserted(identifier, timestamp, ancillaryData);
     }
+
+    /**
+     * @notice Callback for disputes.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     * @param refund refund received in the case that refundOnDispute was enabled.
+     */
+    function priceDisputed(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        uint256 refund
+    ) external {
+        emit MarketDisputed(identifier, timestamp, ancillaryData, refund);
+    }
+
+    /**
+     * @notice Callback for settlement.
+     * @param identifier price identifier being requested.
+     * @param timestamp timestamp of the price being requested.
+     * @param ancillaryData ancillary data of the price being requested.
+     * @param price price that was resolved by the escalation process.
+     */
+    function priceSettled(
+        bytes32 identifier,
+        uint256 timestamp,
+        bytes memory ancillaryData,
+        int256 price
+    ) external {
+        emit MarketResultSettled(identifier, timestamp, ancillaryData, price);
+    }
+    
     /*
     // Callback from settled assertion.
     // If the assertion was resolved true, then the asserter gets the reward and the market is marked as resolved.
@@ -260,7 +360,7 @@ contract PredictionMarket is Auth {
     }
     */
     // Dispute callback does nothing.
-    function assertionDisputedCallback(bytes32 assertionId) public {}
+    //function assertionDisputedCallback(bytes32 assertionId) public {}
     /*
     function _composeClaim(string memory outcome, bytes memory description) internal view returns (bytes memory) {
         return
@@ -381,7 +481,19 @@ contract PredictionMarket is Auth {
         uint256 reward,
         uint256 bond
     ) internal {
-        if (reward > 0) currency.safeTransferFrom(requestor, address(this), reward); // Pull reward.
+        //if (reward > 0) currency.safeTransferFrom(requestor, address(this), reward); // Pull reward.
+        if (reward > 0) {
+            // If the requestor is not the Adapter, the requestor pays for the price request
+            // If not, the Adapter pays for the price request
+            if (requestor != address(this)) {
+                TransferHelper._transferFromERC20(rewardToken, requestor, address(this), reward);
+            }
+
+            // Approve the OO as spender on the reward token from the Adapter
+            if (IERC20(rewardToken).allowance(address(this), address(oo)) < reward) {
+                IERC20(rewardToken).approve(address(oo), type(uint256).max);
+            }
+        }
 
         // Send a price request to the Optimistic oracle
         oo.requestPrice(yesOrNoIdentifier, requestTimestamp, ancillaryData, IERC20(rewardToken), reward);
@@ -394,9 +506,9 @@ contract PredictionMarket is Auth {
             yesOrNoIdentifier,
             requestTimestamp,
             ancillaryData,
-            false, // DO NOT set callback on priceProposed
+            true, // DO NOT set callback on priceProposed
             true, // DO set callback on priceDisputed
-            false // DO NOT set callback on priceSettled
+            true // DO NOT set callback on priceSettled
         );
 
         // Update the proposal bond on the Optimistic oracle if necessary
